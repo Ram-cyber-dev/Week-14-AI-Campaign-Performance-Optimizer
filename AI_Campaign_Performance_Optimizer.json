@@ -1,0 +1,989 @@
+{
+  "name": "\ud83c\udf81 AI Campaign Performance Optimizer \u2014 Self-Running D2C System",
+  "nodes": [
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1CAwT-5s9T551M3ox4OFqnouqXx878yJwuJWc-t18LYQ",
+          "mode": "list",
+          "cachedResultName": "AI Campaign Performance Optimizer",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1CAwT-5s9T551M3ox4OFqnouqXx878yJwuJWc-t18LYQ/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 378848587,
+          "mode": "list",
+          "cachedResultName": "Decision_History",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1CAwT-5s9T551M3ox4OFqnouqXx878yJwuJWc-t18LYQ/edit#gid=XXXXXXXXXX"
+        },
+        "options": {}
+      },
+      "id": "a61f5d17-c03d-424e-832b-b30b398de96d",
+      "name": "\ud83d\udcdc Read Decision History",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -3024,
+        192
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compute week-over-week trends per campaign from the Decision History tab\nconst portfolio = $('\ud83d\udce6 Aggregate Portfolio1').first().json;\nconst historyRows = $input.all().map(i => i.json).filter(r => r && r.Campaign);\nconst num = (v) => { const n = parseFloat(String(v).replace(/[^0-9.\\-]/g,'')); return isNaN(n)?0:n; };\n\n// Group history by campaign name, take last 7 entries per campaign\nconst byCampaign = {};\nhistoryRows.forEach(r => {\n  const name = r.Campaign;\n  if (!byCampaign[name]) byCampaign[name] = [];\n  byCampaign[name].push({\n    date: r.Date || '',\n    roas: num(r.ROAS),\n    ctr: num(r.CTR),\n    cpa: num(r.CPA),\n    spend: num(r.Spend),\n    revenue: num(r.Revenue),\n    action: r.Action || ''\n  });\n});\n\n// For each campaign, compute trend signals\nconst trends = {};\nObject.keys(byCampaign).forEach(name => {\n  const hist = byCampaign[name].slice(-7); // last 7 runs\n  if (hist.length < 2) {\n    trends[name] = { runs: hist.length, roasTrend: 'insufficient_data', avgRoas: hist[0]?.roas || 0, trendNote: 'first run' };\n    return;\n  }\n  const oldest = hist[0].roas;\n  const latest = hist[hist.length - 1].roas;\n  const avgRoas = +(hist.reduce((s, h) => s + h.roas, 0) / hist.length).toFixed(2);\n  const avgCtr = +(hist.reduce((s, h) => s + h.ctr, 0) / hist.length).toFixed(2);\n  const delta = oldest > 0 ? +(((latest - oldest) / oldest) * 100).toFixed(0) : 0;\n  let trend = 'flat';\n  if (delta >= 15) trend = 'accelerating';\n  else if (delta <= -15) trend = 'decelerating';\n  // Streak: count consecutive PAUSE/UNDERPERFORM decisions\n  const recentPauses = hist.slice(-3).filter(h => h.action === 'PAUSE').length;\n  trends[name] = {\n    runs: hist.length,\n    avgRoas, avgCtr,\n    roasTrend: trend,\n    deltaPct: delta,\n    oldestRoas: oldest,\n    latestRoas: latest,\n    recentPauseStreak: recentPauses,\n    trendNote: `${trend} (${delta>=0?'+':''}${delta}% over ${hist.length} runs)`\n  };\n});\n\n// Portfolio-level trend\nconst portfolioHistory = [];\nconst byDate = {};\nhistoryRows.forEach(r => {\n  if (!byDate[r.Date]) byDate[r.Date] = { spend:0, revenue:0 };\n  byDate[r.Date].spend += num(r.Spend);\n  byDate[r.Date].revenue += num(r.Revenue);\n});\nObject.keys(byDate).forEach(d => {\n  const dd = byDate[d];\n  portfolioHistory.push({ date: d, roas: dd.spend>0?+(dd.revenue/dd.spend).toFixed(2):0, spend: dd.spend, revenue: dd.revenue });\n});\n\nreturn [{ json: { ...portfolio, campaignTrends: trends, portfolioHistory: portfolioHistory.slice(-7), historyCount: historyRows.length } }];"
+      },
+      "id": "91e9388b-22c6-4fb0-8578-8ad809027662",
+      "name": "\ud83d\udcc8 Compute Week-over-Week Trends",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2800,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the anomaly detection prompt - looks for things rule-logic misses\nconst d = $input.first().json;\nconst trends = d.campaignTrends || {};\nconst campaignSummary = d.campaigns.map(c => {\n  const t = trends[c.campaignName] || {};\n  return {\n    name: c.campaignName,\n    platform: c.platform,\n    today: { roas: c.roas, ctr: c.ctr, cpa: c.cpa, spend: c.spend, revenue: c.revenue, conversions: c.conversions, impressions: c.impressions, clicks: c.clicks },\n    history: t.runs > 0 ? { avg_roas: t.avgRoas, trend: t.roasTrend, delta_pct: t.deltaPct, runs: t.runs } : 'no_history'\n  };\n});\n\nconst prompt = `You are a senior performance marketing analyst with a sharp eye for anomalies. Scan these campaigns and detect ANYTHING UNUSUAL that rule-based logic might miss.\n\nLook for:\n- TRACKING_ISSUES: spend high but conversions suspiciously low (pixel/tracking broken?)\n- DELIVERY_ISSUES: zero or near-zero impressions despite budget (campaign approval/delivery problem?)\n- VIRAL_SPIKE: sudden CTR or conversion spike vs history (something hit a nerve - investigate why)\n- AUDIENCE_FATIGUE: rising CPM + falling CTR + many days running (creative burned out)\n- BUDGET_PACING: spend is far from daily budget (under-pacing = missed opportunity; full-pacing early = will run out)\n- ATTRIBUTION_GAP: revenue swings massively while spend is stable (attribution lag or tracking issue)\n- DUPLICATE_TARGETING: two campaigns with similar metrics likely fighting for same audience\n- WINNING_PATTERN: any campaign showing strong upward momentum worth doubling down on\n\nCAMPAIGN DATA WITH HISTORY:\n${JSON.stringify(campaignSummary, null, 1)}\n\nReturn EXACT JSON:\n{\n  \"anomalies\": [\n    { \"type\": \"TRACKING_ISSUES | DELIVERY_ISSUES | VIRAL_SPIKE | AUDIENCE_FATIGUE | BUDGET_PACING | ATTRIBUTION_GAP | DUPLICATE_TARGETING | WINNING_PATTERN\",\n      \"campaign\": \"campaign name\",\n      \"severity\": \"critical | high | medium | low\",\n      \"finding\": \"one sharp sentence on what's unusual\",\n      \"recommended_check\": \"what to investigate or do next\" }\n  ],\n  \"opportunities\": [\n    { \"campaign\": \"name\", \"opportunity\": \"what to capitalize on\", \"how\": \"specific action\" }\n  ],\n  \"hidden_risks\": [\n    \"plain-English risk that isn't obvious from numbers alone\"\n  ],\n  \"anomaly_summary\": \"2-3 sentence executive summary of what's hiding in the data\"\n}\n\nIf nothing is anomalous, return empty arrays. Don't fabricate. Indian D2C context. Return ONLY valid JSON, no markdown.`;\n\nreturn [{ json: { ...d, anomalyPrompt: prompt } }];"
+      },
+      "id": "b51d224c-adab-4549-8954-1f7ba851c9a8",
+      "name": "\ud83d\udd27 Build Anomaly Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2576,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"gpt-4o-mini\", max_tokens: 2000, temperature: 0.4, messages: [{ role: \"system\", content: \"You are a paid media anomaly detection expert specializing in D2C brands. Detect hidden issues rule-based logic cannot catch. Return only valid JSON, no markdown.\" }, { role: \"user\", content: $json.anomalyPrompt }] }) }}",
+        "options": {}
+      },
+      "id": "5a020199-13fe-451b-8047-6f3397087d17",
+      "name": "\ud83d\udd75\ufe0f AGENT 3: Anomaly Detector",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -2352,
+        192
+      ],
+      "credentials": {
+        "httpQueryAuth": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Query Auth account"
+        },
+        "openAiApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const aiResp = $input.first().json;\nconst d = $('\ud83d\udd27 Build Anomaly Prompt').first().json;\nlet anomalies = { anomalies: [], opportunities: [], hidden_risks: [], anomaly_summary: 'Scan complete - no anomalies detected.' };\ntry {\n  let raw = '';\n  const parts = aiResp?.candidates?.[0]?.content?.parts || [];\n  for (const p of parts) { if (p && p.text) raw += p.text; }\n  if (raw) {\n    let t = raw.replace(/```json/gi,'').replace(/```/g,'').trim();\n    const s = t.indexOf('{'), e = t.lastIndexOf('}');\n    if (s>=0 && e>s) t = t.substring(s, e+1);\n    anomalies = JSON.parse(t);\n  }\n} catch(e) {}\nreturn [{ json: { ...d, anomalyReport: anomalies } }];"
+      },
+      "id": "5c23a2bc-0b5d-449d-aea4-e660df8ae557",
+      "name": "\ud83d\udd00 Parse Anomalies",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2128,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compute concrete budget reallocation from decisions\nconst d = $input.first().json;\nconst anomalyData = $('\ud83d\udd00 Parse Anomalies').first().json;\nconst trends = anomalyData.campaignTrends || {};\nconst anomalyReport = anomalyData.anomalyReport || { anomalies: [], opportunities: [], hidden_risks: [] };\n\n// Recovered budget from PAUSEs\nconst pausedBudget = d.final\n  .filter(c => c.decision.action === 'PAUSE')\n  .reduce((s, c) => s + c.budget, 0);\n\n// Star campaigns to scale\nconst scaleTargets = d.final.filter(c => c.decision.action === 'SCALE');\n// MAINTAIN campaigns with strong ROAS that could absorb more\nconst maintainStars = d.final.filter(c => c.decision.action === 'MAINTAIN' && c.roas >= c.targetRoas * 1.2);\n\n// Build reallocation plan\nconst reallocation = { recovered_from_pauses: pausedBudget, moves: [], reserve_for_testing: 0 };\nlet remaining = pausedBudget;\n\nscaleTargets.forEach(c => {\n  const suggestedIncrease = Math.round(c.budget * 0.25);\n  const allocation = Math.min(suggestedIncrease, remaining);\n  if (allocation > 0) {\n    reallocation.moves.push({\n      campaign: c.campaignName,\n      action: 'INCREASE',\n      from_budget: c.budget,\n      to_budget: c.budget + allocation,\n      added: allocation,\n      reason: `Scale star (ROAS ${c.roas}x vs target ${c.targetRoas}x)`\n    });\n    remaining -= allocation;\n  }\n});\nmaintainStars.forEach(c => {\n  const suggestedIncrease = Math.round(c.budget * 0.15);\n  const allocation = Math.min(suggestedIncrease, remaining);\n  if (allocation > 0) {\n    reallocation.moves.push({\n      campaign: c.campaignName,\n      action: 'INCREASE',\n      from_budget: c.budget,\n      to_budget: c.budget + allocation,\n      added: allocation,\n      reason: `Healthy performer with room to grow (ROAS ${c.roas}x)`\n    });\n    remaining -= allocation;\n  }\n});\nreallocation.reserve_for_testing = Math.max(0, remaining);\nreallocation.total_allocated = pausedBudget - remaining;\n\n// Compute projected impact\nconst expectedRoas = scaleTargets.length > 0 ? scaleTargets.reduce((s,c)=>s+c.roas,0)/scaleTargets.length : 0;\nconst projectedExtraRevenue = Math.round(reallocation.total_allocated * expectedRoas);\nreallocation.projected_extra_revenue = projectedExtraRevenue;\nreallocation.assumption = `Assuming new budget converts at ${expectedRoas.toFixed(2)}x (avg of scaled campaigns)`;\n\nreturn [{ json: { ...d, campaignTrends: trends, anomalyReport, reallocation } }];"
+      },
+      "id": "1cad16aa-276b-4a0c-9eb1-e87dbeaa3ffe",
+      "name": "\ud83d\udcb0 Budget Reallocation Calculator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        784,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 9
+            }
+          ]
+        }
+      },
+      "id": "b1a33132-4ae8-4a89-99f5-ce13309b20c3",
+      "name": "\u23f0 Daily 9AM Trigger1",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -3920,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1CAwT-5s9T551M3ox4OFqnouqXx878yJwuJWc-t18LYQ",
+          "mode": "list",
+          "cachedResultName": "AI Campaign Performance Optimizer",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1CAwT-5s9T551M3ox4OFqnouqXx878yJwuJWc-t18LYQ/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Campaigns",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1CAwT-5s9T551M3ox4OFqnouqXx878yJwuJWc-t18LYQ/edit#gid=0"
+        },
+        "options": {}
+      },
+      "id": "88e1f7de-fd19-47b2-8d53-0beaec7d8a4c",
+      "name": "\ud83d\udcca Read Campaign Data1",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -3696,
+        192
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compute derived performance metrics + flag status for every campaign\n// Expected sheet columns (each row = one ad campaign/adset for the latest day):\n// Campaign Name, Platform, Status, Daily Budget, Spend, Impressions, Clicks,\n// Conversions, Revenue, Target ROAS, Headline, Primary Text, Yesterday Spend,\n// Yesterday Revenue, Days Running, Creative\n\nconst rows = $input.all();\nconst num = (v) => { const n = parseFloat(String(v).replace(/[^0-9.\\-]/g, '')); return isNaN(n) ? 0 : n; };\n\nconst campaigns = rows.map(r => {\n  const d = r.json;\n  const spend = num(d['Spend']);\n  const revenue = num(d['Revenue']);\n  const impressions = num(d['Impressions']);\n  const clicks = num(d['Clicks']);\n  const conversions = num(d['Conversions']);\n  const budget = num(d['Daily Budget']);\n  const targetRoas = num(d['Target ROAS']) || 3;\n  const yRevenue = num(d['Yesterday Revenue']);\n  const ySpend = num(d['Yesterday Spend']);\n  const daysRunning = num(d['Days Running']) || 1;\n\n  // Core metrics\n  const roas = spend > 0 ? +(revenue / spend).toFixed(2) : 0;\n  const ctr = impressions > 0 ? +((clicks / impressions) * 100).toFixed(2) : 0;\n  const cpc = clicks > 0 ? +(spend / clicks).toFixed(2) : 0;\n  const cpa = conversions > 0 ? +(spend / conversions).toFixed(2) : 0;\n  const convRate = clicks > 0 ? +((conversions / clicks) * 100).toFixed(2) : 0;\n  const budgetUsed = budget > 0 ? +((spend / budget) * 100).toFixed(0) : 0;\n\n  // Trend vs yesterday\n  const yRoas = ySpend > 0 ? +(yRevenue / ySpend).toFixed(2) : 0;\n  const roasDelta = yRoas > 0 ? +(((roas - yRoas) / yRoas) * 100).toFixed(0) : 0;\n\n  // Health classification (rule-based pre-screen; AI makes the final call)\n  let health = 'healthy';\n  if (roas < 1) health = 'critical';            // losing money\n  else if (roas < targetRoas * 0.7) health = 'underperforming';\n  else if (roas >= targetRoas * 1.5) health = 'star';\n\n  return {\n    json: {\n      campaignName: d['Campaign Name'] || 'Unnamed',\n      platform: d['Platform'] || 'Unknown',\n      status: d['Status'] || 'Active',\n      budget, spend, revenue, impressions, clicks, conversions,\n      roas, ctr, cpc, cpa, convRate, budgetUsed,\n      targetRoas, roasDelta, daysRunning, health,\n      headline: d['Headline'] || '',\n      primaryText: d['Primary Text'] || '',\n      creative: d['Creative'] || ''\n    }\n  };\n});\n\nreturn campaigns;"
+      },
+      "id": "d5816e02-6ccd-4502-94fe-d799d9e768f6",
+      "name": "\ud83d\udd27 Compute Metrics + Health1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3472,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Aggregate all campaigns into ONE payload for the AI analyst\nconst all = $input.all().map(i => i.json);\n\nconst totalSpend = all.reduce((s, c) => s + c.spend, 0);\nconst totalRevenue = all.reduce((s, c) => s + c.revenue, 0);\nconst portfolioRoas = totalSpend > 0 ? +(totalRevenue / totalSpend).toFixed(2) : 0;\n\nreturn [{ json: {\n  campaigns: all,\n  campaignCount: all.length,\n  totalSpend: +totalSpend.toFixed(0),\n  totalRevenue: +totalRevenue.toFixed(0),\n  portfolioRoas,\n  runDate: new Date().toLocaleDateString('en-IN', { weekday:'long', year:'numeric', month:'long', day:'numeric' })\n}}];"
+      },
+      "id": "6f534ed3-1092-4338-bfde-7923d302d27f",
+      "name": "\ud83d\udce6 Aggregate Portfolio1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3248,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the AI Analyst prompt - enriched with week-over-week trends + anomaly findings\nconst d = $input.first().json;\nconst c = JSON.stringify(d.campaigns, null, 1);\nconst trends = d.campaignTrends || {};\nconst anomalyReport = d.anomalyReport || { anomalies: [], opportunities: [] };\n\n// Format trends for prompt\nconst trendsText = Object.keys(trends).length > 0 ?\n  Object.entries(trends).map(([name, t]) =>\n    `- ${name}: avg ROAS ${t.avgRoas}x over ${t.runs} runs, trend ${t.roasTrend} (${t.deltaPct>=0?'+':''}${t.deltaPct}%)`\n  ).join('\\n') : 'No historical data yet (first run).';\n\nconst anomalyText = anomalyReport.anomalies?.length > 0 ?\n  anomalyReport.anomalies.map(a => `- [${a.severity?.toUpperCase()}] ${a.campaign}: ${a.finding}`).join('\\n') : 'No anomalies detected.';\n\nconst prompt = `You are a senior performance marketing analyst managing the ad budget for an Indian D2C brand. Analyze TODAY's campaign data and decide the optimal action for EACH campaign.\n\nPORTFOLIO SNAPSHOT (${d.runDate}):\nTotal Spend: INR ${d.totalSpend}\nTotal Revenue: INR ${d.totalRevenue}\nPortfolio ROAS: ${d.portfolioRoas}x\nCampaigns: ${d.campaignCount}\n\nCAMPAIGN DATA:\n${c}\n\nWEEK-OVER-WEEK TRENDS (use these for context, not just today's snapshot):\n${trendsText}\n\nANOMALIES DETECTED:\n${anomalyText}\n\nFor EACH campaign decide ONE action:\n- SCALE: performing well above target, increase budget 20-30%\n- MAINTAIN: on target, keep as is\n- REFRESH_CREATIVE: decent metrics but CTR low or fatiguing (running many days, falling ROAS) - keep targeting, rewrite the ad copy\n- PAUSE: ROAS below 1 (losing money) or far below target with no upside\n- WATCH: too early to judge (low spend / few days) - monitor\n\nCRITICAL: Use the trend data. A campaign at 3x ROAS today but trending downward for 5 days = REFRESH_CREATIVE (not MAINTAIN). A campaign with PAUSE streak in recent history but suddenly up = WATCH carefully.\n\nDecision logic:\n- ROAS < 1 = losing money = usually PAUSE\n- Low CTR (<1%) with decent ROAS = REFRESH_CREATIVE\n- High ROAS (>= 1.5x target) = SCALE\n- Falling ROAS trend (decelerating) + many days running = creative fatigue = REFRESH_CREATIVE\n- Consider budget pacing and statistical significance (don't pause on tiny spend)\n\nReturn EXACT JSON:\n{\n  \"portfolio_summary\": \"2-3 sentence plain-English summary of overall performance today, referencing trends if notable\",\n  \"portfolio_health\": \"healthy | needs_attention | critical\",\n  \"daily_spend_recommendation\": \"Brief recommendation on total budget allocation\",\n  \"decisions\": [\n    {\n      \"campaign_name\": \"exact name\",\n      \"action\": \"SCALE | MAINTAIN | REFRESH_CREATIVE | PAUSE | WATCH\",\n      \"reason\": \"one sharp sentence why (reference trend if relevant)\",\n      \"specific_step\": \"the exact action to take, e.g. 'Increase daily budget from 2000 to 2600'\",\n      \"priority\": \"high | medium | low\",\n      \"needs_creative_rewrite\": true\n    }\n  ],\n  \"top_action_today\": \"The single most important thing to do right now\",\n  \"urgent_alert\": \"If any campaign is bleeding money badly, state it here, else empty string\"\n}\n\nSet needs_creative_rewrite=true ONLY for REFRESH_CREATIVE actions. Indian D2C context, INR. Return ONLY valid JSON, no markdown, no backticks.`;\n\nreturn [{ json: { ...d, analystPrompt: prompt } }];"
+      },
+      "id": "4e95e9f4-f46b-41c3-b220-aafa34862a14",
+      "name": "\ud83d\udd27 Build Analyst Prompt1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1904,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"gpt-4o-mini\", max_tokens: 3000, temperature: 0.5, messages: [{ role: \"system\", content: \"You are a senior D2C media buyer and performance analyst. Make SCALE/PAUSE/REFRESH/MAINTAIN decisions based on trends, anomalies and context. Return only valid JSON, no markdown.\" }, { role: \"user\", content: $json.analystPrompt }] }) }}",
+        "options": {}
+      },
+      "id": "6ef402db-c9e7-4aeb-b924-70638ed5049e",
+      "name": "\ud83e\udde0 AGENT 1: Performance Analyst1",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1680,
+        192
+      ],
+      "credentials": {
+        "httpQueryAuth": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Query Auth account"
+        },
+        "openAiApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the analyst's decisions with robust extraction + fallback\nconst aiResp = $input.first().json;\nconst d = $('\ud83d\udd00 Parse Anomalies').first().json;\n\nlet analysis = {};\ntry {\n  let raw = '';\n  const parts = aiResp?.candidates?.[0]?.content?.parts || [];\n  for (const p of parts) { if (p && p.text) raw += p.text; }\n  if (!raw) raw = '{}';\n  let t = raw.replace(/```json/gi, '').replace(/```/g, '').trim();\n  const s = t.indexOf('{'), e = t.lastIndexOf('}');\n  if (s >= 0 && e > s) t = t.substring(s, e + 1);\n  analysis = JSON.parse(t);\n} catch (e) {\n  // Fallback: rule-based decisions from health flags\n  analysis = {\n    portfolio_summary: 'Automated rule-based analysis (AI parse failed).',\n    portfolio_health: d.portfolioRoas < 1 ? 'critical' : d.portfolioRoas < 2 ? 'needs_attention' : 'healthy',\n    daily_spend_recommendation: 'Review manually.',\n    decisions: d.campaigns.map(c => ({\n      campaign_name: c.campaignName,\n      action: c.health === 'critical' ? 'PAUSE' : c.health === 'star' ? 'SCALE' : c.health === 'underperforming' ? 'REFRESH_CREATIVE' : 'MAINTAIN',\n      reason: 'Rule-based on ROAS ' + c.roas + 'x',\n      specific_step: 'Review campaign',\n      priority: c.health === 'critical' ? 'high' : 'medium',\n      needs_creative_rewrite: c.health === 'underperforming'\n    })),\n    top_action_today: 'Review the dashboard.',\n    urgent_alert: d.campaigns.some(c => c.roas < 1) ? 'One or more campaigns are losing money.' : ''\n  };\n}\n\n// Merge each decision with its full campaign metrics for reporting\nconst decMap = {};\n(analysis.decisions || []).forEach(dec => { decMap[dec.campaign_name] = dec; });\nconst enriched = d.campaigns.map(c => ({\n  ...c,\n  decision: decMap[c.campaignName] || { action: 'WATCH', reason: 'No decision returned', specific_step: '-', priority: 'low', needs_creative_rewrite: false }\n}));\n\n// Campaigns needing a creative rewrite\nconst needRewrite = enriched.filter(c => c.decision.needs_creative_rewrite || c.decision.action === 'REFRESH_CREATIVE');\n\nreturn [{ json: { ...d, analysis, enriched, needRewrite, hasRewrites: needRewrite.length > 0 } }];"
+      },
+      "id": "7ebc3da7-94ec-45ba-a425-1f3edbeaf3d7",
+      "name": "\ud83d\udd00 Parse Decisions1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1456,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the creative-rewrite prompt (only the fatiguing campaigns)\nconst d = $input.first().json;\nif (!d.hasRewrites) { return [{ json: { ...d, rewritePrompt: '', skipRewrite: true } }]; }\n\nconst items = d.needRewrite.map(c => ({\n  campaign: c.campaignName,\n  platform: c.platform,\n  current_headline: c.headline,\n  current_text: c.primaryText,\n  why: c.decision.reason,\n  roas: c.roas, ctr: c.ctr\n}));\n\nconst prompt = `You are an award-winning Indian D2C ad copywriter. These ad creatives are fatiguing (low CTR / falling ROAS). Rewrite each with a FRESH angle while keeping the same product and offer.\n\nFATIGUING ADS:\n${JSON.stringify(items, null, 1)}\n\nFor EACH, write a fresh version with a different hook/angle than the current one. Return EXACT JSON:\n{\n  \"rewrites\": [\n    {\n      \"campaign\": \"exact campaign name\",\n      \"new_headline\": \"fresh headline, under 40 chars\",\n      \"new_primary_text\": \"fresh primary text, under 125 words, new angle\",\n      \"angle_used\": \"what new angle this takes (e.g. social proof, urgency, problem-agitation)\",\n      \"why_better\": \"one line on why this should outperform the old one\"\n    }\n  ]\n}\nIndian English, INR. Return ONLY valid JSON, no markdown, no backticks.`;\n\nreturn [{ json: { ...d, rewritePrompt: prompt, skipRewrite: false } }];"
+      },
+      "id": "88b2b25d-80f5-4ccb-aea2-c1ab983c7569",
+      "name": "\ud83d\udd27 Build Rewrite Prompt1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1232,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"gpt-4o-mini\", max_tokens: 2000, temperature: 0.8, messages: [{ role: \"system\", content: \"You are an expert D2C ad copywriter specializing in high-converting festival and performance creatives. Return only valid JSON, no markdown.\" }, { role: \"user\", content: ($json.rewritePrompt || 'Return {\"rewrites\":[]}') }] }) }}",
+        "options": {}
+      },
+      "id": "21ce0e0c-37c0-4d2e-9ba3-5939bdc8f789",
+      "name": "\u270d\ufe0f AGENT 2: Creative Rewriter1",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1008,
+        192
+      ],
+      "credentials": {
+        "httpQueryAuth": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Query Auth account"
+        },
+        "openAiApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse rewrites, attach to decisions, build everything the report needs\nconst aiResp = $input.first().json;\nconst d = $('\ud83d\udd00 Parse Decisions1').first().json;\n\nlet rewrites = [];\ntry {\n  let raw = '';\n  const parts = aiResp?.candidates?.[0]?.content?.parts || [];\n  for (const p of parts) { if (p && p.text) raw += p.text; }\n  if (raw) {\n    let t = raw.replace(/```json/gi, '').replace(/```/g, '').trim();\n    const s = t.indexOf('{'), e = t.lastIndexOf('}');\n    if (s >= 0 && e > s) t = t.substring(s, e + 1);\n    const parsed = JSON.parse(t);\n    rewrites = parsed.rewrites || [];\n  }\n} catch (e) { rewrites = []; }\n\nconst rwMap = {};\nrewrites.forEach(r => { rwMap[r.campaign] = r; });\n\n// Action counts for the report header\nconst counts = { SCALE:0, MAINTAIN:0, REFRESH_CREATIVE:0, PAUSE:0, WATCH:0 };\nd.enriched.forEach(c => { const a = c.decision.action; if (counts[a] !== undefined) counts[a]++; });\n\n// Attach rewrite text to enriched campaigns\nconst final = d.enriched.map(c => ({ ...c, rewrite: rwMap[c.campaignName] || null }));\n\nreturn [{ json: { ...d, rewrites, rwMap, counts, final } }];"
+      },
+      "id": "e8d8a324-9f43-4eeb-9920-23ba3caea3b6",
+      "name": "\ud83d\udd00 Parse Rewrites + Finalize1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -784,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the daily optimization brief (premium dark HTML email) - ENHANCED\nconst d = $input.first().json;\nconst a = d.analysis;\nconst trends = d.campaignTrends || {};\nconst ar = d.anomalyReport || { anomalies: [], opportunities: [], hidden_risks: [], anomaly_summary: '' };\nconst realloc = d.reallocation || { recovered_from_pauses:0, moves:[], reserve_for_testing:0, total_allocated:0, projected_extra_revenue:0 };\n\nconst c = {bg:'#0d1117',card:'#161b22',border:'#1e293b',orange:'#f97316',blue:'#2563eb',teal:'#0d9488',green:'#22c55e',purple:'#8b5cf6',yellow:'#f59e0b',pink:'#ec4899',red:'#ef4444',white:'#ffffff',light:'#e2e8f0',gray:'#94a3b8'};\n\nconst actionColor = { SCALE:c.green, MAINTAIN:c.blue, REFRESH_CREATIVE:c.yellow, PAUSE:c.red, WATCH:c.gray };\nconst actionEmoji = { SCALE:'\ud83d\udcc8', MAINTAIN:'\u2705', REFRESH_CREATIVE:'\ud83d\udd04', PAUSE:'\u23f8\ufe0f', WATCH:'\ud83d\udc40' };\nconst sevColor = { critical:c.red, high:c.orange, medium:c.yellow, low:c.gray };\nconst healthColor = a.portfolio_health === 'healthy' ? c.green : a.portfolio_health === 'critical' ? c.red : c.yellow;\n\n// Trend badge helper\nconst trendBadge = (campaignName) => {\n  const t = trends[campaignName];\n  if (!t || t.runs < 2) return '<span style=\"display:inline-block;background:'+c.gray+'22;color:'+c.gray+';padding:2px 8px;border-radius:10px;font-size:10px;margin-left:6px;\">NEW</span>';\n  if (t.roasTrend === 'accelerating') return '<span style=\"display:inline-block;background:'+c.green+'22;color:'+c.green+';padding:2px 8px;border-radius:10px;font-size:10px;margin-left:6px;\">\u2191 '+t.deltaPct+'% (7d)</span>';\n  if (t.roasTrend === 'decelerating') return '<span style=\"display:inline-block;background:'+c.red+'22;color:'+c.red+';padding:2px 8px;border-radius:10px;font-size:10px;margin-left:6px;\">\u2193 '+t.deltaPct+'% (7d)</span>';\n  return '<span style=\"display:inline-block;background:'+c.blue+'22;color:'+c.blue+';padding:2px 8px;border-radius:10px;font-size:10px;margin-left:6px;\">flat (7d)</span>';\n};\n\n// Decision rows with trend badges\nconst rows = d.final.map(camp => {\n  const dec = camp.decision;\n  const col = actionColor[dec.action] || c.gray;\n  const em = actionEmoji[dec.action] || '\u2022';\n  let rewriteBlock = '';\n  if (camp.rewrite) {\n    rewriteBlock = '<div style=\"margin-top:10px;background:#1a1f29;border-radius:6px;padding:10px;border-left:3px solid '+c.yellow+';\">' +\n      '<p style=\"color:'+c.yellow+';font-size:10px;margin:0 0 6px;text-transform:uppercase;letter-spacing:1px;\">\ud83d\udd04 FRESH CREATIVE (' + (camp.rewrite.angle_used||'') + ')</p>' +\n      '<p style=\"color:'+c.white+';font-size:13px;font-weight:600;margin:0 0 4px;\">' + (camp.rewrite.new_headline||'') + '</p>' +\n      '<p style=\"color:'+c.light+';font-size:12px;margin:0 0 6px;line-height:1.5;\">' + (camp.rewrite.new_primary_text||'') + '</p>' +\n      '<p style=\"color:'+c.gray+';font-size:11px;margin:0;font-style:italic;\">' + (camp.rewrite.why_better||'') + '</p></div>';\n  }\n  return '<div style=\"background:'+c.card+';border-radius:8px;padding:14px;margin:0 0 12px;border:1px solid '+c.border+';border-left:4px solid '+col+';\">' +\n    '<table style=\"width:100%;border-collapse:collapse;\"><tr>' +\n    '<td style=\"vertical-align:top;\"><p style=\"color:'+c.white+';font-size:14px;font-weight:700;margin:0;\">' + camp.campaignName + trendBadge(camp.campaignName) + '</p>' +\n    '<p style=\"color:'+c.gray+';font-size:11px;margin:2px 0 0;\">' + camp.platform + ' \u2022 ' + camp.daysRunning + ' days running</p></td>' +\n    '<td style=\"text-align:right;vertical-align:top;\"><span style=\"background:'+col+';color:#fff;padding:4px 12px;border-radius:12px;font-size:11px;font-weight:700;\">' + em + ' ' + dec.action.replace('_',' ') + '</span></td>' +\n    '</tr></table>' +\n    '<table style=\"width:100%;border-collapse:collapse;margin-top:10px;\"><tr>' +\n    '<td style=\"padding:4px;text-align:center;\"><p style=\"color:'+(camp.roas>=camp.targetRoas?c.green:c.red)+';font-size:16px;font-weight:800;margin:0;\">' + camp.roas + 'x</p><p style=\"color:'+c.gray+';font-size:9px;margin:0;\">ROAS</p></td>' +\n    '<td style=\"padding:4px;text-align:center;\"><p style=\"color:'+c.white+';font-size:16px;font-weight:800;margin:0;\">' + camp.ctr + '%</p><p style=\"color:'+c.gray+';font-size:9px;margin:0;\">CTR</p></td>' +\n    '<td style=\"padding:4px;text-align:center;\"><p style=\"color:'+c.white+';font-size:16px;font-weight:800;margin:0;\">\u20b9' + camp.cpa + '</p><p style=\"color:'+c.gray+';font-size:9px;margin:0;\">CPA</p></td>' +\n    '<td style=\"padding:4px;text-align:center;\"><p style=\"color:'+c.white+';font-size:16px;font-weight:800;margin:0;\">\u20b9' + camp.spend + '</p><p style=\"color:'+c.gray+';font-size:9px;margin:0;\">SPEND</p></td>' +\n    '<td style=\"padding:4px;text-align:center;\"><p style=\"color:'+c.green+';font-size:16px;font-weight:800;margin:0;\">\u20b9' + camp.revenue + '</p><p style=\"color:'+c.gray+';font-size:9px;margin:0;\">REVENUE</p></td>' +\n    '</tr></table>' +\n    '<div style=\"margin-top:8px;background:'+c.bg+';border-radius:6px;padding:8px 10px;\"><p style=\"color:'+c.light+';font-size:12px;margin:0;\"><b style=\"color:'+col+';\">Action:</b> ' + dec.specific_step + '</p>' +\n    '<p style=\"color:'+c.gray+';font-size:11px;margin:4px 0 0;\">' + dec.reason + '</p></div>' +\n    rewriteBlock + '</div>';\n}).join('');\n\n// Anomaly section\nlet anomalyHtml = '';\nif (ar.anomalies?.length > 0 || ar.opportunities?.length > 0 || ar.hidden_risks?.length > 0) {\n  const anomalyRows = (ar.anomalies||[]).map(an => {\n    const sc = sevColor[an.severity] || c.gray;\n    return '<div style=\"background:'+c.card+';border-radius:6px;padding:10px 12px;margin:6px 0;border-left:3px solid '+sc+';\">' +\n      '<p style=\"margin:0 0 4px;\"><span style=\"background:'+sc+';color:#fff;padding:2px 8px;border-radius:8px;font-size:10px;font-weight:700;\">' + (an.severity||'').toUpperCase() + '</span> <span style=\"color:'+c.white+';font-size:12px;font-weight:600;\">' + (an.type||'').replace(/_/g,' ') + '</span> <span style=\"color:'+c.gray+';font-size:11px;\">\u2022 ' + (an.campaign||'') + '</span></p>' +\n      '<p style=\"color:'+c.light+';font-size:12px;margin:0 0 4px;\">' + (an.finding||'') + '</p>' +\n      '<p style=\"color:'+c.teal+';font-size:11px;margin:0;font-style:italic;\">\u2192 ' + (an.recommended_check||'') + '</p></div>';\n  }).join('');\n  const oppRows = (ar.opportunities||[]).map(o =>\n    '<div style=\"background:'+c.card+';border-radius:6px;padding:10px 12px;margin:6px 0;border-left:3px solid '+c.green+';\">' +\n    '<p style=\"color:'+c.green+';font-size:12px;font-weight:700;margin:0 0 4px;\">\ud83d\udca1 OPPORTUNITY \u2022 ' + (o.campaign||'') + '</p>' +\n    '<p style=\"color:'+c.light+';font-size:12px;margin:0 0 4px;\">' + (o.opportunity||'') + '</p>' +\n    '<p style=\"color:'+c.teal+';font-size:11px;margin:0;font-style:italic;\">\u2192 ' + (o.how||'') + '</p></div>'\n  ).join('');\n  const riskRows = (ar.hidden_risks||[]).map(r => '<p style=\"color:'+c.light+';font-size:12px;margin:4px 0;\">\u26a0\ufe0f ' + r + '</p>').join('');\n\n  anomalyHtml = '<div style=\"background:'+c.bg+';border-radius:8px;padding:16px;margin:0 0 16px;border:1px solid '+c.border+';\">' +\n    '<p style=\"color:'+c.purple+';font-size:11px;font-weight:700;margin:0 0 8px;text-transform:uppercase;\">\ud83d\udd75\ufe0f AGENT 3 \u2014 ANOMALY SCAN</p>' +\n    (ar.anomaly_summary ? '<p style=\"color:'+c.light+';font-size:13px;line-height:1.6;margin:0 0 12px;\">' + ar.anomaly_summary + '</p>' : '') +\n    anomalyRows + oppRows +\n    (riskRows ? '<div style=\"margin-top:8px;padding-top:8px;border-top:1px solid '+c.border+';\"><p style=\"color:'+c.yellow+';font-size:11px;font-weight:700;margin:0 0 4px;\">HIDDEN RISKS</p>' + riskRows + '</div>' : '') +\n    '</div>';\n}\n\n// Budget reallocation section\nlet reallocHtml = '';\nif (realloc.moves?.length > 0 || realloc.recovered_from_pauses > 0) {\n  const moveRows = (realloc.moves||[]).map(m =>\n    '<tr style=\"border-bottom:1px solid '+c.border+';\">' +\n    '<td style=\"padding:8px 10px;color:'+c.white+';font-size:12px;font-weight:600;\">' + m.campaign + '</td>' +\n    '<td style=\"padding:8px 10px;color:'+c.gray+';font-size:11px;\">\u20b9' + m.from_budget + '</td>' +\n    '<td style=\"padding:8px 10px;color:'+c.green+';font-size:11px;font-weight:700;\">\u2192 \u20b9' + m.to_budget + '</td>' +\n    '<td style=\"padding:8px 10px;color:'+c.green+';font-size:11px;\">+\u20b9' + m.added + '</td>' +\n    '<td style=\"padding:8px 10px;color:'+c.gray+';font-size:10px;\">' + m.reason + '</td></tr>'\n  ).join('');\n\n  reallocHtml = '<div style=\"background:'+c.bg+';border-radius:8px;padding:16px;margin:0 0 16px;border:1px solid '+c.border+';border-left:4px solid '+c.green+';\">' +\n    '<p style=\"color:'+c.green+';font-size:11px;font-weight:700;margin:0 0 8px;text-transform:uppercase;\">\ud83d\udcb0 SUGGESTED BUDGET REALLOCATION</p>' +\n    '<table style=\"width:100%;border-collapse:collapse;margin:0 0 10px;\"><tr>' +\n    '<td style=\"text-align:center;\"><p style=\"color:'+c.red+';font-size:18px;font-weight:800;margin:0;\">\u20b9' + realloc.recovered_from_pauses + '</p><p style=\"color:'+c.gray+';font-size:10px;margin:0;\">RECOVERED</p></td>' +\n    '<td style=\"text-align:center;\"><p style=\"color:'+c.green+';font-size:18px;font-weight:800;margin:0;\">\u20b9' + realloc.total_allocated + '</p><p style=\"color:'+c.gray+';font-size:10px;margin:0;\">REALLOCATED</p></td>' +\n    '<td style=\"text-align:center;\"><p style=\"color:'+c.teal+';font-size:18px;font-weight:800;margin:0;\">\u20b9' + realloc.reserve_for_testing + '</p><p style=\"color:'+c.gray+';font-size:10px;margin:0;\">TEST RESERVE</p></td>' +\n    '<td style=\"text-align:center;\"><p style=\"color:'+c.yellow+';font-size:18px;font-weight:800;margin:0;\">+\u20b9' + (realloc.projected_extra_revenue||0) + '</p><p style=\"color:'+c.gray+';font-size:10px;margin:0;\">PROJECTED REV</p></td>' +\n    '</tr></table>' +\n    (moveRows ? '<table style=\"width:100%;border-collapse:collapse;background:'+c.card+';border-radius:6px;overflow:hidden;\"><tr style=\"background:'+c.border+';\"><th style=\"padding:6px 10px;text-align:left;color:'+c.gray+';font-size:10px;\">Campaign</th><th style=\"padding:6px 10px;text-align:left;color:'+c.gray+';font-size:10px;\">From</th><th style=\"padding:6px 10px;text-align:left;color:'+c.gray+';font-size:10px;\">To</th><th style=\"padding:6px 10px;text-align:left;color:'+c.gray+';font-size:10px;\">\u0394</th><th style=\"padding:6px 10px;text-align:left;color:'+c.gray+';font-size:10px;\">Reason</th></tr>' + moveRows + '</table>' : '') +\n    (realloc.assumption ? '<p style=\"color:'+c.gray+';font-size:10px;margin:8px 0 0;font-style:italic;\">' + realloc.assumption + '</p>' : '') +\n    '</div>';\n}\n\nconst urgentBanner = a.urgent_alert ? '<div style=\"background:'+c.red+';border-radius:8px;padding:14px;margin:0 0 16px;\"><p style=\"color:#fff;font-size:14px;font-weight:700;margin:0;\">\ud83d\udea8 URGENT: ' + a.urgent_alert + '</p></div>' : '';\n\nconst email = '<div style=\"background:'+c.bg+';padding:0;font-family:Segoe UI,Arial,sans-serif;max-width:720px;margin:0 auto;\">' +\n  '<div style=\"background:linear-gradient(135deg,#f97316 0%,#dc2626 100%);padding:28px 24px;text-align:center;border-radius:8px 8px 0 0;\">' +\n  '<div style=\"font-size:32px;\">\ud83d\udcca</div><h1 style=\"margin:6px 0 0;color:#fff;font-size:20px;font-weight:800;\">DAILY CAMPAIGN OPTIMIZATION BRIEF</h1>' +\n  '<p style=\"margin:6px 0 0;color:#fed7aa;font-size:13px;\">' + d.runDate + ' \u2022 Powered by 3 AI agents</p></div>' +\n  '<div style=\"background:'+c.card+';padding:24px;border:1px solid '+c.border+';border-top:none;\">' +\n  urgentBanner +\n  '<div style=\"background:'+c.bg+';border-radius:8px;padding:16px;margin:0 0 16px;border:1px solid '+c.border+';border-left:4px solid '+healthColor+';\">' +\n  '<p style=\"color:'+healthColor+';font-size:11px;font-weight:700;margin:0 0 8px;text-transform:uppercase;\">PORTFOLIO HEALTH: ' + (a.portfolio_health||'').replace('_',' ') + '</p>' +\n  '<p style=\"color:'+c.light+';font-size:14px;line-height:1.6;margin:0 0 12px;\">' + (a.portfolio_summary||'') + '</p>' +\n  '<table style=\"width:100%;border-collapse:collapse;\"><tr>' +\n  '<td style=\"text-align:center;\"><p style=\"color:'+c.white+';font-size:20px;font-weight:800;margin:0;\">\u20b9' + d.totalSpend + '</p><p style=\"color:'+c.gray+';font-size:10px;margin:0;\">TOTAL SPEND</p></td>' +\n  '<td style=\"text-align:center;\"><p style=\"color:'+c.green+';font-size:20px;font-weight:800;margin:0;\">\u20b9' + d.totalRevenue + '</p><p style=\"color:'+c.gray+';font-size:10px;margin:0;\">TOTAL REVENUE</p></td>' +\n  '<td style=\"text-align:center;\"><p style=\"color:'+(d.portfolioRoas>=2?c.green:c.yellow)+';font-size:20px;font-weight:800;margin:0;\">' + d.portfolioRoas + 'x</p><p style=\"color:'+c.gray+';font-size:10px;margin:0;\">PORTFOLIO ROAS</p></td>' +\n  '</tr></table></div>' +\n  '<div style=\"margin:0 0 16px;text-align:center;\">' +\n  '<span style=\"display:inline-block;background:'+c.green+'22;color:'+c.green+';padding:6px 12px;border-radius:14px;font-size:12px;font-weight:700;margin:3px;\">\ud83d\udcc8 ' + d.counts.SCALE + ' Scale</span>' +\n  '<span style=\"display:inline-block;background:'+c.yellow+'22;color:'+c.yellow+';padding:6px 12px;border-radius:14px;font-size:12px;font-weight:700;margin:3px;\">\ud83d\udd04 ' + d.counts.REFRESH_CREATIVE + ' Refresh</span>' +\n  '<span style=\"display:inline-block;background:'+c.red+'22;color:'+c.red+';padding:6px 12px;border-radius:14px;font-size:12px;font-weight:700;margin:3px;\">\u23f8\ufe0f ' + d.counts.PAUSE + ' Pause</span>' +\n  '<span style=\"display:inline-block;background:'+c.blue+'22;color:'+c.blue+';padding:6px 12px;border-radius:14px;font-size:12px;font-weight:700;margin:3px;\">\u2705 ' + d.counts.MAINTAIN + ' Maintain</span>' +\n  '<span style=\"display:inline-block;background:'+c.gray+'22;color:'+c.gray+';padding:6px 12px;border-radius:14px;font-size:12px;font-weight:700;margin:3px;\">\ud83d\udc40 ' + d.counts.WATCH + ' Watch</span>' +\n  '</div>' +\n  '<div style=\"background:linear-gradient(135deg,#f9731622,#dc262622);border-radius:8px;padding:14px;margin:0 0 20px;border:1px solid '+c.orange+'44;\">' +\n  '<p style=\"color:'+c.orange+';font-size:11px;font-weight:700;margin:0 0 4px;text-transform:uppercase;\">\ud83c\udfaf TOP ACTION TODAY</p>' +\n  '<p style=\"color:'+c.white+';font-size:14px;font-weight:600;margin:0;\">' + (a.top_action_today||'') + '</p></div>' +\n  anomalyHtml +\n  reallocHtml +\n  '<h2 style=\"color:'+c.white+';font-size:16px;margin:0 0 12px;\">\ud83d\udccb Campaign Decisions</h2>' +\n  rows +\n  '<div style=\"background:'+c.bg+';border-radius:8px;padding:14px;margin:16px 0 0;border:1px solid '+c.border+';\">' +\n  '<p style=\"color:'+c.teal+';font-size:11px;font-weight:700;margin:0 0 4px;text-transform:uppercase;\">\ud83d\udcb0 BUDGET STRATEGY</p>' +\n  '<p style=\"color:'+c.light+';font-size:13px;margin:0;\">' + (a.daily_spend_recommendation||'') + '</p></div>' +\n  '</div>' +\n  '<div style=\"background:'+c.bg+';padding:12px;text-align:center;border-radius:0 0 8px 8px;border:1px solid '+c.border+';border-top:none;\">' +\n  '<p style=\"color:#475569;font-size:11px;margin:0;\">AI Campaign Optimizer \u2022 3 Agents (Analyst + Anomaly + Rewriter) \u2022 Auto-generated ' + d.runDate + '</p></div></div>';\n\n// Telegram - now includes anomaly count\nconst tgLines = [];\ntgLines.push('\ud83d\udcca *Campaign Brief \u2014 ' + d.runDate + '*');\ntgLines.push('Portfolio ROAS: *' + d.portfolioRoas + 'x* | Spend \u20b9' + d.totalSpend + ' \u2192 Rev \u20b9' + d.totalRevenue);\nif (a.urgent_alert) tgLines.push('\ud83d\udea8 ' + a.urgent_alert);\ntgLines.push('\ud83d\udcc8 ' + d.counts.SCALE + ' scale | \ud83d\udd04 ' + d.counts.REFRESH_CREATIVE + ' refresh | \u23f8\ufe0f ' + d.counts.PAUSE + ' pause');\nif (ar.anomalies?.length > 0) tgLines.push('\ud83d\udd75\ufe0f ' + ar.anomalies.length + ' anomalies detected (see email)');\nif (realloc.total_allocated > 0) tgLines.push('\ud83d\udcb0 Reallocating \u20b9' + realloc.total_allocated + ' \u2192 projected +\u20b9' + realloc.projected_extra_revenue);\ntgLines.push('\ud83c\udfaf ' + (a.top_action_today||''));\nconst telegramMsg = tgLines.join('\\n');\n\nreturn [{ json: { ...d, reportHtml: email, telegramMsg } }];"
+      },
+      "id": "e14f1877-7b63-490f-9fa0-eb489b7d8cdf",
+      "name": "\ud83d\udcdd Build Optimization Brief1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1008,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "YOUR_EMAIL@example.com",
+        "subject": "={{ '\ud83d\udcca Daily Campaign Brief \u2014 ' + $json.runDate + ' | ROAS ' + $json.portfolioRoas + 'x | ' + $json.counts.PAUSE + ' to pause, ' + $json.counts.SCALE + ' to scale' }}",
+        "message": "={{ $json.reportHtml }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "3d420b27-c34b-4337-8db4-acb500f4a460",
+      "name": "\ud83d\udce7 Email Brief to Owner1",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1232,
+        0
+      ],
+      "webhookId": "05f4c48b-f644-499a-b9cd-bfcccffa747a",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "-1003949272320",
+        "text": "={{ $json.telegramMsg }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "657ede90-44a6-49bb-8c52-58b94d72bf95",
+      "name": "\ud83d\udcf2 Telegram Alert1",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1232,
+        192
+      ],
+      "webhookId": "bdad3188-46d1-4e9d-9456-68b96609ec41",
+      "credentials": {
+        "telegramApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Flatten decisions into rows for the History log tab\nconst d = $input.first().json;\nreturn d.final.map(c => ({ json: {\n  Date: d.runDate,\n  Campaign: c.campaignName,\n  Platform: c.platform,\n  ROAS: c.roas,\n  CTR: c.ctr,\n  CPA: c.cpa,\n  Spend: c.spend,\n  Revenue: c.revenue,\n  Action: c.decision.action,\n  Reason: c.decision.reason,\n  Step: c.decision.specific_step,\n  Priority: c.decision.priority,\n  'New Headline': c.rewrite ? c.rewrite.new_headline : '',\n  'New Copy': c.rewrite ? c.rewrite.new_primary_text : ''\n}}));"
+      },
+      "id": "0ee05485-0f0a-4080-9d8d-fa55379abf67",
+      "name": "\ud83d\udd27 Build History Rows1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1232,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1CAwT-5s9T551M3ox4OFqnouqXx878yJwuJWc-t18LYQ",
+          "mode": "list",
+          "cachedResultName": "AI Campaign Performance Optimizer",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1CAwT-5s9T551M3ox4OFqnouqXx878yJwuJWc-t18LYQ/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 378848587,
+          "mode": "list",
+          "cachedResultName": "Decision_History",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1CAwT-5s9T551M3ox4OFqnouqXx878yJwuJWc-t18LYQ/edit#gid=XXXXXXXXXX"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Date",
+              "displayName": "Date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Campaign",
+              "displayName": "Campaign",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Platform",
+              "displayName": "Platform",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ROAS",
+              "displayName": "ROAS",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "CTR",
+              "displayName": "CTR",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "CPA",
+              "displayName": "CPA",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Spend",
+              "displayName": "Spend",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Revenue",
+              "displayName": "Revenue",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Action",
+              "displayName": "Action",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Reason",
+              "displayName": "Reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Step",
+              "displayName": "Step",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Priority",
+              "displayName": "Priority",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "New Headline",
+              "displayName": "New Headline",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "New Copy",
+              "displayName": "New Copy",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "01da5a34-fa3c-4159-a18f-b9b8faa31f2b",
+      "name": "\ud83d\udcca Log Decisions to History1",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1456,
+        384
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"gpt-4o-mini\", max_tokens: 1000, messages: [{ role: \"system\", content: \"You are a D2C performance marketing expert specializing in creative fatigue prediction. Return only valid JSON, no markdown.\" }, { role: \"user\", content: \"Analyze these campaigns for creative fatigue risk: \" + JSON.stringify($json.campaigns.map(c => ({ name: c.campaignName, daysRunning: c.daysRunning, ctr: c.ctr, roas: c.roas, roasDelta: c.roasDelta, creative: c.creative, headline: c.headline }))) + \". Return JSON: { \\\"fatigue_predictions\\\": [{ \\\"campaign\\\": \\\"...\\\", \\\"fatigue_risk\\\": \\\"high/medium/low\\\", \\\"days_until_fatigue\\\": \\\"...\\\", \\\"fatigue_signals\\\": [\\\"...\\\"], \\\"recommended_refresh_date\\\": \\\"...\\\", \\\"creative_lifespan_score\\\": \\\"1-10\\\" }], \\\"portfolio_fatigue_index\\\": \\\"...\\\", \\\"urgent_refreshes\\\": [\\\"campaign names needing immediate creative refresh\\\"] }\" }] }) }}",
+        "options": {}
+      },
+      "id": "c4f43d1d-3212-4319-8571-327d4ac14fc1",
+      "name": "\ud83d\udd2e Creative Fatigue Predictor",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -560,
+        192
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nconst campaignData = $('\ud83d\udd00 Parse Rewrites + Finalize1').first().json;\n\nlet text = \"\";\ntry {\n  text = input.choices[0].message.content;\n} catch (e) {}\n\nlet fatigueData = {};\ntry {\n  const cleanedText = text.replace(/```json\\n?|\\n?```/g, '').trim();\n  fatigueData = JSON.parse(cleanedText);\n} catch (error) {}\n\nreturn [{\n  json: {\n    ...campaignData,\n    fatiguePredictions: fatigueData\n  }\n}];"
+      },
+      "id": "8883fdbb-cc51-4db7-8e9c-59a2daf2079f",
+      "name": "\ud83d\udd00 Parse Fatigue Predictions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -336,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"gpt-4o-mini\", max_tokens: 800, messages: [{ role: \"system\", content: \"You are a paid media auditor specializing in ad spend anomaly detection. Return only valid JSON, no markdown.\" }, { role: \"user\", content: \"Audit this ad portfolio for spend anomalies: Total Spend: \" + $json.totalSpend + \", Total Revenue: \" + $json.totalRevenue + \", Portfolio ROAS: \" + $json.portfolioRoas + \", Campaigns: \" + JSON.stringify($json.campaigns.map(c => ({ name: c.campaignName, spend: c.spend, budget: c.budget, budgetUsed: c.budgetUsed, roas: c.roas, yesterdaySpend: c.yesterdaySpend, yesterdayRevenue: c.yesterdayRevenue }))) + \". Return JSON: { \\\"anomalies_detected\\\": [{ \\\"campaign\\\": \\\"...\\\", \\\"anomaly_type\\\": \\\"...\\\", \\\"severity\\\": \\\"critical/warning/info\\\", \\\"description\\\": \\\"...\\\", \\\"recommended_action\\\": \\\"...\\\" }], \\\"total_wasted_spend_estimate\\\": \\\"...\\\", \\\"immediate_actions\\\": [\\\"...\\\", \\\"...\\\"], \\\"portfolio_health_score\\\": \\\"1-10\\\", \\\"alert_summary\\\": \\\"one line summary for Telegram\\\" }\" }] }) }}",
+        "options": {}
+      },
+      "id": "cf0cd867-d3ca-48af-8f20-c83e19421c75",
+      "name": "\ud83d\udea8 Spend Anomaly Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -112,
+        192
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nconst campaignData = $('\ud83d\udd00 Parse Fatigue Predictions').first().json;\n\nlet text = \"\";\ntry { text = input.choices[0].message.content; } catch (e) {}\n\nlet anomalyData = {};\ntry {\n  const cleanedText = text.replace(/```json\\n?|\\n?```/g, '').trim();\n  anomalyData = JSON.parse(cleanedText);\n} catch (error) {}\n\nreturn [{ json: { ...campaignData, spendAnomalies: anomalyData } }];"
+      },
+      "id": "13d7e53b-e94c-43d2-9df1-b9ae2f9c562d",
+      "name": "\ud83d\udd00 Parse Spend Anomalies",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        112,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"gpt-4o-mini\", max_tokens: 1000, messages: [{ role: \"system\", content: \"You are a D2C growth strategist writing weekly performance summaries for brand owners. Return only valid JSON, no markdown.\" }, { role: \"user\", content: \"Generate a weekly performance summary based on this data: Portfolio ROAS: \" + $json.portfolioRoas + \", Total Spend: \" + $json.totalSpend + \", Total Revenue: \" + $json.totalRevenue + \", Campaign Count: \" + $json.campaignCount + \", Trends: \" + JSON.stringify($json.trends) + \", Decisions Made Today: \" + JSON.stringify($json.decisions ? $json.decisions.map(d => ({ campaign: d.campaignName, action: d.action, reason: d.reason })) : []) + \". Return JSON: { \\\"week_headline\\\": \\\"one powerful headline summarizing this week\\\", \\\"performance_verdict\\\": \\\"excellent/good/needs_attention/critical\\\", \\\"top_win\\\": \\\"biggest win this week\\\", \\\"biggest_risk\\\": \\\"biggest risk to address\\\", \\\"budget_efficiency_score\\\": \\\"1-10\\\", \\\"recommended_weekly_budget_change\\\": \\\"increase/decrease/maintain with % and reason\\\", \\\"next_week_priorities\\\": [\\\"priority 1\\\", \\\"priority 2\\\", \\\"priority 3\\\"], \\\"executive_summary\\\": \\\"3 sentence summary for brand owner\\\" }\" }] }) }}",
+        "options": {}
+      },
+      "id": "4e38423d-abb9-434f-9790-0f712083963a",
+      "name": "\ud83d\udcca Weekly Performance Summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        336,
+        192
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nconst campaignData = $('\ud83d\udd00 Parse Spend Anomalies').first().json;\n\nlet text = \"\";\ntry { text = input.choices[0].message.content; } catch (e) {}\n\nlet summaryData = {};\ntry {\n  const cleanedText = text.replace(/```json\\n?|\\n?```/g, '').trim();\n  summaryData = JSON.parse(cleanedText);\n} catch (error) {}\n\nreturn [{ json: { ...campaignData, weeklySummary: summaryData } }];"
+      },
+      "id": "c8cac180-89af-4a2d-be27-097298b37384",
+      "name": "\ud83d\udd00 Parse Weekly Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        192
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "\ud83d\udcdc Read Decision History": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udcc8 Compute Week-over-Week Trends",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udcc8 Compute Week-over-Week Trends": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udd27 Build Anomaly Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udd27 Build Anomaly Prompt": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udd75\ufe0f AGENT 3: Anomaly Detector",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udd75\ufe0f AGENT 3: Anomaly Detector": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udd00 Parse Anomalies",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udd00 Parse Anomalies": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udd27 Build Analyst Prompt1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udcb0 Budget Reallocation Calculator": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udcdd Build Optimization Brief1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\u23f0 Daily 9AM Trigger1": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udcca Read Campaign Data1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udcca Read Campaign Data1": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udd27 Compute Metrics + Health1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udd27 Compute Metrics + Health1": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udce6 Aggregate Portfolio1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udce6 Aggregate Portfolio1": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udcdc Read Decision History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udd27 Build Analyst Prompt1": {
+      "main": [
+        [
+          {
+            "node": "\ud83e\udde0 AGENT 1: Performance Analyst1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83e\udde0 AGENT 1: Performance Analyst1": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udd00 Parse Decisions1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udd00 Parse Decisions1": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udd27 Build Rewrite Prompt1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udd27 Build Rewrite Prompt1": {
+      "main": [
+        [
+          {
+            "node": "\u270d\ufe0f AGENT 2: Creative Rewriter1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\u270d\ufe0f AGENT 2: Creative Rewriter1": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udd00 Parse Rewrites + Finalize1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udcdd Build Optimization Brief1": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udce7 Email Brief to Owner1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "\ud83d\udcf2 Telegram Alert1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "\ud83d\udd27 Build History Rows1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udd27 Build History Rows1": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udcca Log Decisions to History1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udd00 Parse Rewrites + Finalize1": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udd2e Creative Fatigue Predictor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udd2e Creative Fatigue Predictor": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udd00 Parse Fatigue Predictions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udd00 Parse Fatigue Predictions": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udea8 Spend Anomaly Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udea8 Spend Anomaly Alert": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udd00 Parse Spend Anomalies",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udd00 Parse Spend Anomalies": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udcca Weekly Performance Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udcca Weekly Performance Summary": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udd00 Parse Weekly Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "\ud83d\udd00 Parse Weekly Summary": {
+      "main": [
+        [
+          {
+            "node": "\ud83d\udcb0 Budget Reallocation Calculator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "versionId": "YOUR_VERSION_ID",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "id": "YOUR_WORKFLOW_ID",
+  "tags": []
+}
