@@ -1,9 +1,7 @@
 # 🎯 AI Campaign Performance Optimizer — Self-Running D2C System
-### Week 14 — Haus of Intelligence Cohort
 
 Runs at 9 AM every day. No human trigger. Reads your ad data, makes decisions, rewrites creatives, detects anomalies, predicts fatigue, and delivers a premium brief to your inbox — while you slept.
 
----
 
 ## 🎯 What Makes This Different
 
@@ -15,7 +13,6 @@ Every project until Week 14 required a human to fill a form. **This one runs its
 - Has **memory** — remembers last week's decisions to detect trends
 - Delivers brief + Telegram alert every morning automatically
 
----
 
 ## 🤖 What It Does Daily
 
@@ -35,11 +32,9 @@ Every project until Week 14 required a human to fill a form. **This one runs its
 14. **Fires Telegram alert** with key decisions
 15. **Logs every decision** to history for tomorrow's memory
 
----
 
 ## 🏗️ Architecture (27 nodes)
 
-```
 9AM Trigger → Read Campaigns → Compute Metrics → Aggregate Portfolio →
 Read Decision History → Compute Trends → Build Anomaly Prompt →
 Agent3:Anomaly Detector → Parse Anomalies → Build Analyst Prompt →
@@ -50,9 +45,7 @@ Spend Anomaly Alert → Parse Anomalies →
 Weekly Performance Summary → Parse Summary →
 Budget Reallocation → Build Brief →
 Email to Owner + Telegram Alert + Log to History
-```
 
----
 
 ## ⚙️ Tech Stack
 
@@ -66,7 +59,6 @@ Email to Owner + Telegram Alert + Log to History
 | Email Delivery | Gmail API |
 | Instant Alerts | Telegram Bot |
 
----
 
 ## 🚀 Key Features
 
@@ -79,7 +71,6 @@ Email to Owner + Telegram Alert + Log to History
 - **Budget Reallocation** — exact ₹ moves computed automatically
 - **Dual delivery** — HTML email + Telegram alert
 
----
 
 ## 💡 Business Case
 
@@ -89,7 +80,6 @@ This catches it daily.
 
 Also works for: HVAC/plumbing Google Ads, real estate Meta ads, any lead-gen business running paid campaigns.
 
----
 
 ## 🔧 Setup
 
@@ -111,16 +101,17 @@ Also works for: HVAC/plumbing Google Ads, real estate Meta ads, any lead-gen bus
 5. Update Telegram Chat ID in the Telegram Alert node
 6. The 9 AM trigger runs automatically — or hit Execute to test manually
 
----
 
 ## 🎬 Demo Data
 
 7 GlowVeda campaigns across Meta and Google — Diwali Serum Retargeting, Gold Radiance Prospecting, Vitamin C Awareness, and more. Portfolio spend ₹13,020, revenue ₹45,580, portfolio ROAS 3.5x.
 
----
 
 ## 👤 Author
 
-**Ram** — AI Automation Agency founder  
+Built by Ram
+Founder, MissedCallRecovery.org — AI voice receptionist 
+platform for US plumbing and HVAC businesses
+Available for freelance AI automation projects
 Building done-for-you AI systems for D2C brands and service businesses  
 [GitHub](https://github.com/Ram-cyber-dev)
